@@ -1,0 +1,15 @@
+
+services:
+
+  app:
+    image: anno-mark-bot:latest
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    logging:
+      driver: journald
+      options:
+        mode: non-blocking
+        max-buffer-size: 64m
+        tag: anno-mark-bot

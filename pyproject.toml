@@ -1,0 +1,73 @@
+[project]
+name = "anno-med-bot"
+version = "0.1.0"
+description = "Annotation+Medical"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiogram>=3.22.0",
+    "alembic>=1.16.5",
+    "asyncpg>=0.30.0",
+    "dishka>=1.7.2",
+    "fastapi>=0.117.1",
+    "httptools>=0.6.4",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "lxml>=6.0.2",
+    "pydantic-settings>=2.11.0",
+    "redis>=6.4.0",
+    "sqlalchemy[asyncio]>=2.0.43",
+    "uvicorn>=0.37.0",
+    "uvloop>=0.21.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.2",
+    "pre-commit>=4.3.0",
+    "ruff>=0.13.2",
+    "types-pyyaml>=6.0.12.20250915",
+    "watchfiles>=1.1.0",
+]
+
+[tool.mypy]
+plugins = [
+  "pydantic.mypy"
+]
+show_error_codes = true
+follow_imports = "silent"
+strict_optional = true
+warn_redundant_casts = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_reexport = false
+warn_unused_configs = true
+disallow_subclassing_any = true
+disallow_incomplete_defs = true
+ignore_missing_imports = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
+enable_error_code = ["ignore-without-code"]
+
+[tool.ruff]
+fix = true
+line-length = 120
+lint.select = ["ALL"]
+lint.ignore = [
+  "D",        # pydocstyle
+  "RUF001",
+  "RUF002",
+  "RUF003",
+  "TRY400",
+  "TRY301",
+  "S104",
+  "PLR2004",
+  "PLR0913",
+  "COM812",
+  "PIE804",
+]
+lint.isort.no-lines-before = ["standard-library", "local-folder"]
+extend-exclude = [
+  "alembic/*"
+]
