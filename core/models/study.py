@@ -1,9 +1,14 @@
 import enum
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Enum, ForeignKey, SmallInteger, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.models.base import BaseModel
+from core.models.study_category import study_category_study_association
+
+if TYPE_CHECKING:
+    from core.models.study_category import StudyCategory
 
 
 class StudyStatusEnum(enum.Enum):
@@ -39,3 +44,7 @@ class Study(BaseModel):
     nc_upload_link: Mapped[str | None] = mapped_column(nullable=True)
     nc_last_upload_link: Mapped[str | None] = mapped_column(nullable=True)
     reject_comment_msg_id: Mapped[int | None] = mapped_column(nullable=True)
+    categories: Mapped[list["StudyCategory"]] = relationship(
+        secondary=study_category_study_association,
+        back_populates="studies",
+    )

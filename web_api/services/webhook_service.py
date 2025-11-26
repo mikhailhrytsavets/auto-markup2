@@ -72,6 +72,9 @@ class WebhookService:
                     ],
                 ),
             )
+            batch.categories.extend(
+                await self.uow.categories.get_or_create_many(parsed_config["categories"]),
+            )
             await self.uow.commit()
 
         logger.info("Batch {} succesfully processed", path.name)
@@ -105,7 +108,9 @@ class WebhookService:
             detail = "Structure error for config.yaml - missing project->pathology"
             logger.debug(detail)
             raise ConfigStructureError(detail) from e
-        return {"project": project}
+        categories = data.get("classes", [])
+        categories = categories if isinstance(categories, list) else []
+        return {"project": project, "categories": categories}
 
     def _parse_mapping(self, batch_path: PurePosixPath, mapping_content: bytes) -> list[tuple[str, str]]:
         if not mapping_content:

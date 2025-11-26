@@ -23,6 +23,10 @@ class StudyAnnoReviewRequest(CallbackData, prefix="study-anno-review-req"):
     study_id: int
 
 
+class StudyAnnoReviewRequestConfirmed(CallbackData, prefix="confirmed-study-anno-review-req"):
+    study_id: int
+
+
 class StudyAnnoReviewReRequest(CallbackData, prefix="study-anno-review-rereq"):
     study_id: int
 
@@ -50,6 +54,26 @@ class ApproveAnno(CallbackData, prefix="approve-anno"):
 
 
 class ConfirmApproveAnno(CallbackData, prefix="confirm-approve-anno"):
+    study_id: int
+
+
+class CheckCategories(CallbackData, prefix="check-categories"):
+    study_id: int
+
+
+class ChooseCategoriesAnno(CallbackData, prefix="choose-categories-anno"):
+    study_id: int
+    batch_id: int
+    category_id: int | None = None
+
+
+class ChooseCategoriesValid(CallbackData, prefix="choose-categories-valid"):
+    study_id: int
+    batch_id: int
+    category_id: int | None = None
+
+
+class ConfirmCategories(CallbackData, prefix="confirm-categories"):
     study_id: int
 
 
@@ -86,9 +110,12 @@ class ExpertAnno(CallbackData, prefix="expert-anno"):
     study_id: int
 
 
+class ExpertAnnoView(CallbackData, prefix="view-expert-anno"):
+    study_id: int
+
+
 class ExpertCloseAnno(CallbackData, prefix="expert-close-anno"):
     study_id: int
-    study_status: StudyStatusEnum
 
 
 class ExpertReworkReview(CallbackData, prefix="expert-rework-review"):
@@ -110,11 +137,11 @@ def get_assigned_study_text(study: Study) -> Text:
 
 def get_assigned_study_kb(study: Study) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    callback_data_class: type[StudyAnnoReviewRequest | StudyAnnoReviewReRequest]
+    callback_data: ChooseCategoriesAnno | StudyAnnoReviewReRequest
     if study.status == StudyStatusEnum.ASSIGNED:
-        callback_data_class = StudyAnnoReviewRequest
+        callback_data = ChooseCategoriesAnno(study_id=study.id, batch_id=study.batch_id)
     else:
-        callback_data_class = StudyAnnoReviewReRequest
-    kb.button(text="👁️‍🗨️ Запросить проверку", callback_data=callback_data_class(study_id=study.id))
+        callback_data = StudyAnnoReviewReRequest(study_id=study.id)
+    kb.button(text="👁️‍🗨️ Запросить проверку", callback_data=callback_data)
     kb.button(text="Отклонить", callback_data=StudyReport(study_id=study.id))
     return cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())

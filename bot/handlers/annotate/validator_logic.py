@@ -2,10 +2,10 @@ import asyncio
 from typing import TYPE_CHECKING, cast
 
 from aiogram import Dispatcher, F, Router, types
-from aiogram.filters import or_f
+from aiogram.filters import StateFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.callback_answer import CallbackAnswer
-from aiogram.utils.formatting import Bold, Code, Text, TextLink, Url, as_line, as_list
+from aiogram.utils.formatting import Bold, Code, Text, TextLink, Url, as_line, as_list, as_marked_list
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.media_group import MediaGroupBuilder
 from dishka.integrations.aiogram import FromDishka
@@ -15,10 +15,14 @@ from bot.handlers.annotate.utils import (
     AnnoReview,
     ApproveAnno,
     ApproveWithSelfAnno,
+    CheckCategories,
+    ChooseCategoriesValid,
     CloseAnno,
     CloseAnnoReason,
     ConfirmApproveAnno,
+    ConfirmCategories,
     ExpertAnno,
+    ExpertAnnoView,
     ExpertCloseAnno,
     ExpertReworkReview,
     PreExpertAnno,
@@ -30,6 +34,7 @@ from bot.handlers.annotate.utils import (
     get_assigned_study_text,
 )
 from bot.middleware.album_middleware import MediaGroupMiddleware
+from bot.states.check_categories import CheckCategoriesView
 from bot.states.expert_pre_anno import ExpertPreAnno
 from bot.states.reject import RejectState
 from core.config import Settings
@@ -56,7 +61,6 @@ async def annotate_review(
     async with async_lock, uow:
         study = await uow.studies.get_by_id(study_id)
         if not study:
-            logger.error("Study with id={} is not found", study_id)
             callback_answer.text, callback_answer.show_alert = "Ошибка - нет такого исследования", True
             return
 
@@ -187,21 +191,151 @@ async def rework_review_start(
     await cq.message.delete()
 
 
-async def approve_anno(cq: types.CallbackQuery, callback_data: StudyAnnoReview) -> None:
+async def approve_anno(cq: types.CallbackQuery, callback_data: ApproveAnno, state: FSMContext) -> None:
     if TYPE_CHECKING:
         assert isinstance(cq.message, types.Message)
     kb = InlineKeyboardBuilder()
-    kb.button(text="Да", callback_data=ConfirmApproveAnno(study_id=callback_data.study_id))
+    kb.button(text="Да", callback_data=CheckCategories(study_id=callback_data.study_id))
     kb.button(text="Да, но с доразметкой", callback_data=ApproveWithSelfAnno(study_id=callback_data.study_id))
     kb.button(text="Отмена", callback_data=AnnoReview(study_id=callback_data.study_id))
     reply_markup = cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())
     await cq.message.edit_text(text="Вы точно желаете подтвердить корректность разметки?", reply_markup=reply_markup)
+    await state.set_state(CheckCategoriesView.from_default_approve)
+
+
+async def check_categories(
+    cq: types.CallbackQuery,
+    callback_data: CheckCategories,
+    callback_answer: CallbackAnswer,
+    state: FSMContext,
+    uow: FromDishka[IUnitOfWork],
+    nc_util: FromDishka[NextcloudUtils],
+) -> None:
+    if TYPE_CHECKING:
+        assert isinstance(cq.message, types.Message)
+
+    await state.update_data(choosed_categories=[])
+
+    async with uow:
+        study = await uow.studies.get_with_categories(study_id=callback_data.study_id)
+        if not study:
+            callback_answer.text, callback_answer.show_alert = "Ошибка - нет такого исследования", True
+            return
+        batch_id = study.batch_id
+
+        batch = await uow.batches.get_with_categories(batch_id=batch_id)
+        if not batch:
+            callback_answer.text, callback_answer.show_alert = "Ошибка - батч не найден", True
+            return
+        batch_categories = batch.categories
+
+        study_categories_names = [category.name for category in study.categories]
+        study_categories_ids = [category.id for category in study.categories]
+
+    fsm_state = await state.get_state()
+    if not fsm_state:
+        logger.error("fsm_state is None")
+        callback_answer.text, callback_answer.show_alert = "Ошибка - обратитесь к администратору", True
+        return
+    check_categories_from_state = getattr(CheckCategoriesView, fsm_state.split(":")[1])
+
+    if not batch_categories:
+        # Для батча нет в принципе категорий - скипаем их выбор
+        cd: ConfirmApproveAnno | ExpertCloseAnno
+        if check_categories_from_state == CheckCategoriesView.from_default_approve:
+            func = approve_anno_confirmed
+            cd = ConfirmApproveAnno(study_id=callback_data.study_id)
+        else:
+            func = expert_annotate_finish  # type: ignore[assignment]
+            cd = ExpertCloseAnno(study_id=callback_data.study_id)
+        await func(
+            cq=cq,
+            callback_data=cd,  # type: ignore[arg-type]
+            callback_answer=callback_answer,
+            state=state,
+            uow=uow,
+            nc_util=nc_util,
+        )
+        return
+    if not study_categories_names:
+        # Для батча есть предопределенные категории, но разметчик ни одну не выбрал
+        text = as_list(
+            Text("🔹 Разметчик не выбрал никакой класс"),
+        )
+    else:
+        text = as_list(
+            Text("🔹 Разметчик выбрал следующие классы:"),
+            as_marked_list(*study_categories_names),
+        )
+        await state.update_data(choosed_categories=study_categories_ids)
+
+    cd_1: ConfirmApproveAnno | ExpertCloseAnno
+    cd_2: ApproveAnno | ExpertAnnoView
+    if check_categories_from_state == CheckCategoriesView.from_default_approve:
+        cd_1 = ConfirmApproveAnno(study_id=callback_data.study_id)
+        cd_2 = ApproveAnno(study_id=callback_data.study_id)
+    else:
+        cd_1 = ExpertCloseAnno(study_id=callback_data.study_id)
+        cd_2 = ExpertAnnoView(study_id=callback_data.study_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Подтвердить", callback_data=cd_1)
+    kb.button(
+        text="✏️ Выбрать класс",
+        callback_data=ChooseCategoriesValid(study_id=callback_data.study_id, batch_id=batch_id),
+    )
+    kb.button(text="↩️ Обратно", callback_data=cd_2)
+    reply_markup = cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())
+
+    await cq.message.edit_text(**text.as_kwargs(), reply_markup=reply_markup)
+
+
+async def choose_categories(
+    cq: types.CallbackQuery,
+    callback_data: ChooseCategoriesValid,
+    callback_answer: CallbackAnswer,
+    uow: FromDishka[IUnitOfWork],
+    state: FSMContext,
+) -> None:
+    if TYPE_CHECKING:
+        assert isinstance(cq.message, types.Message)
+
+    chosed = await state.get_value("choosed_categories")
+    if not chosed:
+        chosed = []
+    if callback_data.category_id:
+        if callback_data.category_id in chosed:
+            chosed.remove(callback_data.category_id)
+        else:
+            chosed.append(callback_data.category_id)
+    await state.update_data(choosed_categories=chosed)
+
+    kb = InlineKeyboardBuilder()
+    async with uow:
+        batch = await uow.batches.get_with_categories(batch_id=callback_data.batch_id)
+        if not batch:
+            callback_answer.text, callback_answer.show_alert = "Ошибка - батч не найден", True
+            return
+        for category in batch.categories:
+            kb.button(
+                text=f"✅ {category.name}" if category.id in chosed else category.name,
+                callback_data=ChooseCategoriesValid(
+                    study_id=callback_data.study_id,
+                    batch_id=batch.id,
+                    category_id=category.id,
+                ),
+            )
+    kb.button(text="✅ Подтвердить", callback_data=ConfirmCategories(study_id=callback_data.study_id))
+    kb.button(text="↩️ Отмена", callback_data=CheckCategories(study_id=callback_data.study_id))
+    reply_markup = cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())
+
+    await cq.message.edit_text(text="🔹 Выберите категории исследования", reply_markup=reply_markup)
 
 
 async def approve_anno_confirmed(
     cq: types.CallbackQuery,
-    callback_data: StudyAnnoReview,
+    callback_data: ConfirmApproveAnno | ConfirmCategories,
     callback_answer: CallbackAnswer,
+    state: FSMContext,
     uow: FromDishka[IUnitOfWork],
     nc_util: FromDishka[NextcloudUtils],
 ) -> None:
@@ -209,17 +343,22 @@ async def approve_anno_confirmed(
         assert isinstance(cq.message, types.Message)
         assert cq.bot
 
-    study_iuid = callback_data.study_id
+    study_id = callback_data.study_id
     async with uow:
-        study = await uow.studies.update(
-            study_iuid,
-            {
-                "status": StudyStatusEnum.APPROVED,
-            },
-        )
+        study = await uow.studies.get_with_categories(study_id)
         if not study:
             callback_answer.text, callback_answer.show_alert = "Ошибка - нет такого исследования", True
             return
+
+        if isinstance(callback_data, ConfirmCategories):
+            study.categories.clear()
+            category_ids = await state.get_value("choosed_categories")
+            if category_ids:
+                categories = await uow.categories.get_by_ids(category_ids)
+                study.categories.extend(categories)
+
+        study.status = StudyStatusEnum.APPROVED
+
         if not study.annotator_id:
             callback_answer.text, callback_answer.show_alert = "Ошибка - у разметки нет разметчика", True
             return
@@ -237,11 +376,7 @@ async def approve_anno_confirmed(
     await cq.message.edit_text(**text.as_kwargs())
     text = as_line(
         Text("✅ Эксперт "),
-        as_line(
-            TextLink(expert.name, url=f"tg://user?id={expert.tg_id}"),
-            Text(f" (@{expert.tg_username})") if expert.tg_username else Text(),
-            end="",
-        ),
+        expert.name,
         Text(" одобрил разметку исследования - "),
         Code(study.study_iuid),
     )
@@ -249,6 +384,7 @@ async def approve_anno_confirmed(
         chat_id=study.annotator_id,
         **text.as_kwargs(),
     )
+
     with logger.contextualize(
         user_id=cq.from_user.id,
         study_iuid=study.study_iuid,
@@ -262,6 +398,8 @@ async def approve_anno_confirmed(
     await nc_util.copy_directory(src_dir=latest_upload, dst_dir=dst_path)
     with logger.contextualize(study_iuid=study.study_iuid, iteration_count=study.iteration_count):
         logger.info("The latest annotation version was copied to the 3-research directory")
+
+    await state.clear()
 
 
 async def close_anno(cq: types.CallbackQuery, callback_data: StudyAnnoReview) -> None:
@@ -322,10 +460,6 @@ async def close_anno_reason_choosen(
         if not expert:
             callback_answer.text, callback_answer.show_alert = "Вы не зарегистрированы в боте!", True
             return
-        expert_data = as_line(
-            TextLink(expert.name, url=f"tg://user?id={expert.tg_id}"),
-            Text(f" (@{expert.tg_username})") if expert.tg_username else Text(),
-        )
 
     text = as_list(
         get_anno_review_text(study),
@@ -335,7 +469,7 @@ async def close_anno_reason_choosen(
     await cq.message.edit_text(**text.as_kwargs())
     text = as_line(
         Text("❗️ Эксперт "),
-        expert_data,
+        expert.name,
         Text(" закрыл разметку исследования: "),
         Code(study.study_iuid),
         Text(f"\nПричина: {callback_data.reason.name}"),
@@ -467,14 +601,10 @@ async def send_reject(
         if not expert:
             callback_answer.text, callback_answer.show_alert = "Вы не зарегистрированы в боте!", True
             return
-        expert_data = as_line(
-            TextLink(expert.name, url=f"tg://user?id={expert.tg_id}"),
-            Text(f" (@{expert.tg_username})") if expert.tg_username else Text(),
-        )
 
     text = as_line(
         Text("❗️ Эксперт "),
-        expert_data,
+        expert.name,
         Text(" запросил доразметку исследования: "),
         Code(study.study_iuid),
         Text("\n\nКомментарий в сообщении ниже"),
@@ -553,6 +683,11 @@ async def expert_annotate(
     if cq.from_user is None:
         return
 
+    if isinstance(callback_data, ExpertAnno):
+        await state.set_state(CheckCategoriesView.from_expert_annotate)
+    else:
+        await state.set_state(CheckCategoriesView.from_approve_with_self_anno)
+
     async with uow:
         study = await uow.studies.get_by_id(study_id)
         if not study:
@@ -576,15 +711,7 @@ async def expert_annotate(
 
     text = get_assigned_study_text(study)
     kb = InlineKeyboardBuilder()
-    kb.button(
-        text="Закрыть",
-        callback_data=ExpertCloseAnno(
-            study_id=study_id,
-            study_status=StudyStatusEnum.CLOSED_F
-            if isinstance(callback_data, ExpertAnno)
-            else StudyStatusEnum.APPROVED_F,
-        ),
-    )
+    kb.button(text="Закрыть", callback_data=CheckCategories(study_id=study_id))
     reply_markup = cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())
     await cq.message.edit_text(**text.as_kwargs(), reply_markup=reply_markup)
     with logger.contextualize(
@@ -611,19 +738,56 @@ async def expert_annotate(
             **text.as_kwargs(),
         )
         callback_answer.text = "Сообщение отправлено разметчику ✅"
-        await state.clear()
+
+
+async def expert_annotate_view_only(
+    cq: types.CallbackQuery,
+    callback_data: ExpertAnnoView,
+    callback_answer: CallbackAnswer,
+    uow: FromDishka[IUnitOfWork],
+) -> None:
+    if TYPE_CHECKING:
+        assert isinstance(cq.message, types.Message)
+
+    async with uow:
+        study = await uow.studies.get_by_id(callback_data.study_id)
+        if not study:
+            callback_answer.text, callback_answer.show_alert = "Ошибка - нет такого исследования", True
+            return
+        text = get_assigned_study_text(study)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="Закрыть",
+        callback_data=CheckCategories(study_id=callback_data.study_id),
+    )
+    reply_markup = cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())
+    await cq.message.edit_text(**text.as_kwargs(), reply_markup=reply_markup)
 
 
 async def expert_annotate_finish(
     cq: types.CallbackQuery,
-    callback_data: ExpertCloseAnno,
+    callback_data: ExpertCloseAnno | ConfirmCategories,
     callback_answer: CallbackAnswer,
+    state: FSMContext,
     uow: FromDishka[IUnitOfWork],
     nc_util: FromDishka[NextcloudUtils],
 ) -> None:
     if TYPE_CHECKING:
         assert isinstance(cq.message, types.Message)
         assert cq.bot
+
+    fsm_state = await state.get_state()
+    if not fsm_state:
+        logger.error("fsm_state is None")
+        callback_answer.text, callback_answer.show_alert = "Ошибка - обратитесь к администратору", True
+        return
+    check_categories_from = getattr(CheckCategoriesView, fsm_state.split(":")[1])
+    if check_categories_from == CheckCategoriesView.from_expert_annotate:
+        study_finish_status = StudyStatusEnum.CLOSED_F
+    else:
+        # for CheckCategoriesView.from_approve_with_self_anno
+        study_finish_status = StudyStatusEnum.APPROVED_F
 
     study_id = callback_data.study_id
     async with uow:
@@ -637,21 +801,19 @@ async def expert_annotate_finish(
         upload_path = study.study_path.replace("1-original-data", "2-check")
         annotate_path = f"{upload_path}/version_{study_iteration}"
 
-    empty = await nc_util.is_directory_empty(path=annotate_path)
-    if empty:
-        callback_answer.text, callback_answer.show_alert = "Вы ничего не выгрузили", True
-        return
-
-    async with uow:
-        study = await uow.studies.update(
-            study_id,
-            {
-                "status": callback_data.study_status,
-            },
-        )
-        if not study:
-            callback_answer.text, callback_answer.show_alert = "Ошибка - нет такого исследования", True
+        empty = await nc_util.is_directory_empty(path=annotate_path)
+        if empty:
+            callback_answer.text, callback_answer.show_alert = "Вы ничего не выгрузили", True
             return
+
+        if isinstance(callback_data, ConfirmCategories):
+            study.categories.clear()
+            category_ids = await state.get_value("choosed_categories")
+            if category_ids:
+                categories = await uow.categories.get_by_ids(category_ids)
+                study.categories.extend(categories)
+
+        study.status = study_finish_status
         await uow.commit()
 
     text = as_list(
@@ -674,14 +836,23 @@ async def expert_annotate_finish(
     with logger.contextualize(study_iuid=study.study_iuid, iteration_count=study.iteration_count):
         logger.info("The latest annotation version was copied to the 3-research directory")
 
+    await state.clear()
+
 
 def register_handlers(dp: Dispatcher) -> None:
     router = Router(name=__name__)
     router.callback_query.register(annotate_review, or_f(StudyAnnoReview.filter(), StudyReportReview.filter()))
-    router.callback_query.register(rework_review_start, ExpertReworkReview.filter())
-    router.callback_query.register(approve_anno, ApproveAnno.filter())
     router.callback_query.register(annotate_review_view_only, AnnoReview.filter())
-    router.callback_query.register(approve_anno_confirmed, ConfirmApproveAnno.filter())
+    router.callback_query.register(rework_review_start, ExpertReworkReview.filter())
+
+    router.callback_query.register(approve_anno, ApproveAnno.filter())
+    router.callback_query.register(check_categories, CheckCategories.filter())
+    router.callback_query.register(choose_categories, ChooseCategoriesValid.filter())
+    router.callback_query.register(
+        approve_anno_confirmed,
+        or_f(ConfirmApproveAnno.filter(), ConfirmCategories.filter()),
+        CheckCategoriesView.from_default_approve,
+    )
 
     router.callback_query.register(close_anno, CloseAnno.filter())
     router.callback_query.register(close_anno_reason_choosen, CloseAnnoReason.filter())
@@ -698,6 +869,11 @@ def register_handlers(dp: Dispatcher) -> None:
     router.callback_query.register(pre_expert_annotate, PreExpertAnno.filter())
     router.message.register(conslusion_for_annotator_writen, F.text, ExpertPreAnno.waiting_for_conslusion)
     router.callback_query.register(expert_annotate, or_f(ExpertAnno.filter(), ApproveWithSelfAnno.filter()))
-    router.callback_query.register(expert_annotate_finish, ExpertCloseAnno.filter())
+    router.callback_query.register(expert_annotate_view_only, ExpertAnnoView.filter())
+    router.callback_query.register(
+        expert_annotate_finish,
+        or_f(ExpertCloseAnno.filter(), ConfirmCategories.filter()),
+        StateFilter(CheckCategoriesView.from_expert_annotate, CheckCategoriesView.from_approve_with_self_anno),
+    )
 
     dp.include_router(router)

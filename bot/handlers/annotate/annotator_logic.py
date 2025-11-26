@@ -1,7 +1,9 @@
+import asyncio
 from typing import TYPE_CHECKING, cast
 
 from aiogram import Dispatcher, F, Router, types
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.utils.callback_answer import CallbackAnswer
 from aiogram.utils.formatting import Bold, Code, Text, TextLink, as_line, as_list
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -9,6 +11,7 @@ from dishka.integrations.aiogram import FromDishka
 from loguru import logger
 
 from bot.handlers.annotate.utils import (
+    ChooseCategoriesAnno,
     ChooseProjectCallback,
     ExpertReworkReview,
     ReAnnoStudy,
@@ -60,7 +63,9 @@ async def command_task(msg: types.Message, uow: FromDishka[IUnitOfWork]) -> None
     await msg.answer(**text.as_kwargs(), reply_markup=reply_markup)
 
 
-async def callback_command_task(cq: types.CallbackQuery, uow: FromDishka[IUnitOfWork]) -> None:
+async def callback_command_task(cq: types.CallbackQuery, uow: FromDishka[IUnitOfWork], state: FSMContext) -> None:
+    await state.clear()
+
     if TYPE_CHECKING:
         assert isinstance(cq.message, types.Message)
 
@@ -147,11 +152,73 @@ async def assign_annotate_to_user(
     await cq.message.edit_text(**text.as_kwargs(), reply_markup=reply_markup)
 
 
+async def choose_categories(
+    cq: types.CallbackQuery,
+    callback_data: ChooseCategoriesAnno,
+    callback_answer: CallbackAnswer,
+    uow: FromDishka[IUnitOfWork],
+    state: FSMContext,
+    nc_util: FromDishka[NextcloudUtils],
+) -> None:
+    if TYPE_CHECKING:
+        assert isinstance(cq.message, types.Message)
+
+    chosed = await state.get_value("choosed_categories")
+    if not chosed:
+        chosed = []
+    if callback_data.category_id:
+        if callback_data.category_id in chosed:
+            chosed.remove(callback_data.category_id)
+        else:
+            chosed.append(callback_data.category_id)
+    await state.update_data(choosed_categories=chosed)
+
+    categories_missing = False
+    kb = InlineKeyboardBuilder()
+    async with uow:
+        batch = await uow.batches.get_with_categories(batch_id=callback_data.batch_id)
+        if not batch:
+            callback_answer.text, callback_answer.show_alert = "Ошибка - батч не найден", True
+            return
+        if not batch.categories:
+            categories_missing = True
+        else:
+            for category in batch.categories:
+                kb.button(
+                    text=f"✅ {category.name}" if category.id in chosed else category.name,
+                    callback_data=ChooseCategoriesAnno(
+                        study_id=callback_data.study_id,
+                        batch_id=batch.id,
+                        category_id=category.id,
+                    ),
+                )
+    if categories_missing:
+        await annotate_review_request(
+            cq,
+            StudyAnnoReviewRequest(study_id=callback_data.study_id),
+            callback_answer,
+            uow,
+            state,
+            nc_util,
+        )
+        return
+    kb.button(text="✅ Подтвердить", callback_data=StudyAnnoReviewRequest(study_id=callback_data.study_id))
+    kb.button(text="↩️ Отмена", callback_data="task")
+    reply_markup = cast("types.InlineKeyboardMarkup", kb.adjust(1).as_markup())
+
+    text = "🔹 Выберите класс исследования\n* либо сразу нажмите кнопку 'Подтвердить' без выбора класса"
+    await cq.message.edit_text(text=text, reply_markup=reply_markup)
+
+
+review_request_lock = asyncio.Lock()
+
+
 async def annotate_review_request(
     cq: types.CallbackQuery,
     callback_data: StudyAnnoReviewRequest,
     callback_answer: CallbackAnswer,
     uow: FromDishka[IUnitOfWork],
+    state: FSMContext,
     nc_util: FromDishka[NextcloudUtils],
 ) -> None:
     if TYPE_CHECKING:
@@ -159,41 +226,48 @@ async def annotate_review_request(
         assert isinstance(cq.message, types.Message)
 
     study_id = callback_data.study_id
-    async with uow:
-        study = await uow.studies.get_by_id(study_id)
+    category_ids = await state.get_value("choosed_categories")
+    async with review_request_lock, uow:
+        study = await uow.studies.get_with_categories(study_id)
         if not study:
             logger.error("Study with id {} not found", study_id)
             callback_answer.text, callback_answer.show_alert = "Ошибка - исследование не найдено", True
             return
+        if study.status not in (StudyStatusEnum.ASSIGNED, StudyStatusEnum.REWORK):
+            with logger.contextualize(
+                user_id=cq.from_user.id,
+                study_iuid=study.study_iuid,
+                iteration_count=study.iteration_count,
+            ):
+                logger.debug("Double review request detected, skip")
+            return
+
         study_iteration = study.iteration_count
         upload_path = study.study_path.replace("1-original-data", "2-check")
         annotate_path = f"{upload_path}/version_{study_iteration}"
-
-    empty = await nc_util.is_directory_empty(path=annotate_path)
-    if empty:
-        callback_answer.text, callback_answer.show_alert = "Вы ничего не выгрузили", True
-        return
-
-    async with uow:
-        study = await uow.studies.update(
-            study_id,
-            {
-                "status": StudyStatusEnum.WAITING_REVIEW,
-            },
-        )
-        if not study:
-            logger.error("Study with id {} not found", study_id)
-            callback_answer.text, callback_answer.show_alert = "Ошибка - исследование не найдено", True
+        empty = await nc_util.is_directory_empty(path=annotate_path)
+        if empty:
+            callback_answer.text, callback_answer.show_alert = "Вы ничего не выгрузили", True
             return
+
+        study.categories.clear()
+        if category_ids:
+            categories = await uow.categories.get_by_ids(category_ids)
+            study.categories.extend(categories)
+
+        study.status = StudyStatusEnum.WAITING_REVIEW
+
         project = await uow.projects.get_by_batch_id(batch_id=study.batch_id)
         if not project:
             logger.error("Project for batch_id={} not found", study.batch_id)
             callback_answer.text, callback_answer.show_alert = "Ошибка - проект не найден", True
             return
+
         annotator = await uow.users.get_by_id(cq.from_user.id)
         if not annotator:
             callback_answer.text, callback_answer.show_alert = "Вы не зарегистрированы в боте!", True
             return
+
         await uow.commit()
 
     test = as_list(
@@ -216,6 +290,7 @@ async def annotate_review_request(
         **test.as_kwargs(),
         reply_markup=reply_markup,
     )
+
     with logger.contextualize(
         user_id=cq.from_user.id,
         study_iuid=study.study_iuid,
@@ -226,6 +301,8 @@ async def annotate_review_request(
     text = as_list(get_assigned_study_text(study), as_line(Bold("UPD: "), Text("отправлено на проверку")))
     await cq.message.edit_text(**text.as_kwargs())
     callback_answer.text = "Запрос на проверку успешно отправлен ✅"
+
+    await state.clear()
 
 
 async def report_study(cq: types.CallbackQuery, callback_data: StudyReport) -> None:
@@ -357,6 +434,9 @@ async def reannotate(
         logger.info("User took studies for re-annotation")
 
 
+reannotate_review_request_lock = asyncio.Lock()
+
+
 async def reannotate_review_request(
     cq: types.CallbackQuery,
     callback_data: StudyAnnoReviewReRequest,
@@ -369,17 +449,21 @@ async def reannotate_review_request(
         assert isinstance(cq.message, types.Message)
 
     study_id = callback_data.study_id
-    async with uow:
-        study = await uow.studies.update(
-            study_id,
-            {
-                "status": StudyStatusEnum.WAITING_REVIEW,
-            },
-        )
+    async with reannotate_review_request_lock, uow:
+        study = await uow.studies.get_by_id(study_id)
         if not study:
             logger.error("Study with id={} is not found", callback_data.study_id)
             callback_answer.text = "Ошибка - исследование не найдено"
             return
+        if study.status != StudyStatusEnum.REWORK:
+            with logger.contextualize(
+                user_id=cq.from_user.id,
+                study_iuid=study.study_iuid,
+                iteration_count=study.iteration_count,
+            ):
+                logger.debug("Double review request detected, skip")
+            return
+        study.status = StudyStatusEnum.WAITING_REVIEW
         if study.expert_id is None:
             logger.error("Expert for study with id={} is not found", callback_data.study_id)
             callback_answer.text = "Ошибка - исследованию не назначен эксперт"
@@ -423,7 +507,9 @@ def register_handlers(dp: Dispatcher) -> None:
     router = Router(name=__name__)
     router.message.register(command_task, Command("task"))
     router.callback_query.register(assign_annotate_to_user, ChooseProjectCallback.filter())
+    router.callback_query.register(choose_categories, ChooseCategoriesAnno.filter())
     router.callback_query.register(annotate_review_request, StudyAnnoReviewRequest.filter())
+
     router.callback_query.register(report_study, StudyReport.filter())
     router.callback_query.register(report_study_reason_choosen, StudyReportReason.filter())
     router.callback_query.register(callback_command_task, F.data == "task")

@@ -7,6 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
 from core.repositories.batch_repo import BatchRepositoryProtocol, BatchSQLAlchemyRepository
 from core.repositories.project_repo import ProjectRepositoryProtocol, ProjectSQLAlchemyRepository
+from core.repositories.study_category_repo import (
+    StudyCategoryRepositoryProtocol,
+    StudyCategorySQLAlchemyRepository,
+)
 from core.repositories.study_repo import StudyRepositoryProtocol, StudySQLAlchemyRepository
 from core.repositories.user_repo import UserRepositoryProtocol, UserSQLAlchemyRepository
 
@@ -27,6 +31,10 @@ class IUnitOfWork(abc.ABC):
     @property
     @abc.abstractmethod
     def users(self) -> UserRepositoryProtocol: ...
+
+    @property
+    @abc.abstractmethod
+    def categories(self) -> StudyCategoryRepositoryProtocol: ...
 
     @abc.abstractmethod
     async def __aenter__(self) -> Self: ...
@@ -58,6 +66,7 @@ class SqlAlchemyUnitOfWork(IUnitOfWork):
         self._batches: BatchRepositoryProtocol | None = None
         self._studies: StudyRepositoryProtocol | None = None
         self._users: UserRepositoryProtocol | None = None
+        self._categories: StudyCategoryRepositoryProtocol | None = None
 
     async def __aenter__(self) -> Self:
         self.session = self._session_factory()
@@ -72,6 +81,7 @@ class SqlAlchemyUnitOfWork(IUnitOfWork):
         self._batches = BatchSQLAlchemyRepository(self.session)
         self._studies = StudySQLAlchemyRepository(self.session)
         self._users = UserSQLAlchemyRepository(self.session)
+        self._categories = StudyCategorySQLAlchemyRepository(self.session)
         return self
 
     async def __aexit__(
@@ -93,6 +103,7 @@ class SqlAlchemyUnitOfWork(IUnitOfWork):
             self._batches = None
             self._studies = None
             self._users = None
+            self._categories = None
 
     @property
     def projects(self) -> ProjectRepositoryProtocol:
@@ -121,6 +132,13 @@ class SqlAlchemyUnitOfWork(IUnitOfWork):
             msg = "UnitOfWork is closed; repositories are not available"
             raise RuntimeError(msg)
         return self._users
+
+    @property
+    def categories(self) -> StudyCategoryRepositoryProtocol:
+        if self._categories is None:
+            msg = "UnitOfWork is closed; repositories are not available"
+            raise RuntimeError(msg)
+        return self._categories
 
     async def commit(self) -> None:
         if self._tx is None or self.session is None:

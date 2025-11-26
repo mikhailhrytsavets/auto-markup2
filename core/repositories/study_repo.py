@@ -2,6 +2,7 @@ from typing import Protocol, runtime_checkable
 
 from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from core.models.batch import Batch
 from core.models.study import Study, StudyStatusEnum
@@ -13,6 +14,8 @@ class StudyRepositoryProtocol(RepositoryProtocol[Study], Protocol):
     async def get_by_iuid(self, iuid: str) -> Study | None: ...
 
     async def exists(self, iuid: str) -> bool: ...
+
+    async def get_with_categories(self, study_id: int) -> Batch | None: ...
 
     async def get_assigned_for_annotator(self, user_id: int) -> Study | None: ...
 
@@ -38,6 +41,11 @@ class StudySQLAlchemyRepository(BaseSQLAlchemyRepository[Study], StudyRepository
         q = select(exists().where(self.model.study_iuid == iuid))
         res = await self.session.execute(q)
         return bool(res.scalar())
+
+    async def get_with_categories(self, study_id: int) -> Batch | None:
+        q = select(self.model).where(self.model_pk == study_id).options(joinedload(self.model.categories))
+        res = await self.session.execute(q)
+        return res.unique().scalar_one_or_none()
 
     async def get_assigned_for_annotator(self, user_id: int) -> Study | None:
         q = (
